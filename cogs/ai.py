@@ -5,6 +5,7 @@ Auto-respond AI channel — assign a channel and the bot replies to every messag
 Memory system — store server context (staff names, rules, etc.) the AI draws on.
 Export/import memory via JSON file.
 Per-user rate limiting — global default + per-user overrides.
+Character limit — set max response length, enforced via truncation.
 """
 
 import discord
@@ -38,7 +39,7 @@ async def _cf_request(account_id: str, api_token: str, messages: list, max_token
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
     
     headers = {
-        "Authorization": f"Bearer {api_token.strip()}", 
+        "Authorization": f"Bearer {api_token.strip()}",
         "Content-Type": "application/json"
     }
     payload = {
@@ -60,12 +61,17 @@ async def _cf_request(account_id: str, api_token: str, messages: list, max_token
             
             return data["choices"][0]["message"]["content"].strip()
 
-def _build_system_prompt(memory: dict) -> str:
+def _build_system_prompt(memory: dict, char_limit: int = None) -> str:
+    """Build the system prompt. Optionally include a character limit."""
     lines = [
         "You are a helpful assistant for this Discord server.",
-        "Keep responses concise and under 1800 characters.",
-        "Respond in plain conversational text only — no markdown bold, italics, or headers.",
+        "Keep responses concise and in plain conversational text — no markdown bold, italics, or headers.",
     ]
+    if char_limit:
+        lines.append(f"Keep your entire response under {char_limit} characters.")
+    else:
+        lines.append("Keep responses concise and under 1800 characters.")
+
     if memory:
         lines.append("\nServer context:")
         for key, value in memory.items():
@@ -230,13 +236,36 @@ class AI(commands.Cog):
             ephemeral=True,
         )
 
+    @slash.command(name="charlimit", description="Set the maximum character length for AI responses. Use 0 to remove the limit.")
+    @app_commands.describe(limit="Maximum characters (1–2000) or 0 to disable")
+    @app_commands.default_permissions(administrator=True)
+    async def charlimit(self, interaction: discord.Interaction, limit: int):
+        if limit < 0 or limit > 2000:
+            return await interaction.response.send_message(
+                "❌ Limit must be between 1 and 2000, or 0 to disable.", ephemeral=True
+            )
+
+        d = _ai_data(interaction.guild.id)
+
+        if limit == 0:
+            d.pop("char_limit", None)
+            _save_ai_data(interaction.guild.id, d)
+            await interaction.response.send_message(
+                "✅ Character limit removed. AI responses will not be truncated (except by Discord's 2000‑character limit).",
+                ephemeral=True,
+            )
+        else:
+            d["char_limit"] = limit
+            _save_ai_data(interaction.guild.id, d)
+            await interaction.response.send_message(
+                f"✅ AI responses will now be truncated to **{limit}** characters maximum.", ephemeral=True
+            )
 
     @slash.command(name="limits", description="Show current AI rate limits and model info.")
     @app_commands.default_permissions(manage_channels=True)
     async def limits(self, interaction: discord.Interaction):
         d = _ai_data(interaction.guild.id)
 
-  
         gl = d.get("rate_limit")
         if gl:
             global_str = f"{gl['messages']} message(s) per {gl['window']}s"
@@ -248,6 +277,12 @@ class AI(commands.Cog):
         ch_str = f"<#{ch_id}>" if ch_id else "Not set"
         category = interaction.guild.get_channel(int(category_id)) if category_id else None
         category_str = category.name if category else ("Not set" if not category_id else f"Unknown category `{category_id}`")
+
+        char_limit = d.get("char_limit")
+        if char_limit:
+            char_limit_str = f"{char_limit} characters"
+        else:
+            char_limit_str = "No enforced limit (Discord max 2000)"
 
         user_limits = d.get("user_limits", {})
         if user_limits:
@@ -264,6 +299,7 @@ class AI(commands.Cog):
             f"**Model:** `{CF_MODEL}`",
             f"**AI Channel:** {ch_str}",
             f"**AI Category:** {category_str}",
+            f"**Character limit:** {char_limit_str}",
             f"**Global rate limit:** {global_str}",
             f"**Per-user overrides:**\n{overrides_str}",
         ]
@@ -421,7 +457,8 @@ class AI(commands.Cog):
             return
 
         memory        = d.get("memory", {})
-        system_prompt = _build_system_prompt(memory)
+        char_limit    = d.get("char_limit")  # may be None
+        system_prompt = _build_system_prompt(memory, char_limit)
 
         guild_history = self._history.setdefault(message.guild.id, {})
         user_history  = guild_history.setdefault(message.author.id, [])
@@ -440,12 +477,18 @@ class AI(commands.Cog):
                     messages
                 )
 
+                # Enforce character limit if set
+                if char_limit is not None and char_limit > 0:
+                    if len(reply) > char_limit:
+                        reply = reply[:char_limit]
+
                 user_history.append({"role": "user",      "content": clean_user_message})
                 user_history.append({"role": "assistant", "content": reply})
                 
                 if len(user_history) > 40:
                     guild_history[message.author.id] = user_history[-40:]
 
+                # Discord hard limit is 2000, but our char_limit is ≤2000 anyway
                 await message.reply(reply[:2000], mention_author=False)
                 
             except Exception:
