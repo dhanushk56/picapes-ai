@@ -11,7 +11,7 @@ class Config:
     CLOUDFLARE_ACCOUNT_ID: str = ""
     CLOUDFLARE_API_TOKEN: str = ""
 
-    COOKIE_API_KEY: str = "https://api.cookie-api.com/api/transcript?channel_id={channel.id}"
+    COOKIE_API_KEY: str = ""
 
     GUILD_ID: int = int(os.getenv("GUILD_ID", "0") or 0)
 
