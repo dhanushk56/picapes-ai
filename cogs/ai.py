@@ -8,7 +8,7 @@ Per-user rate limiting — global default + per-user overrides.
 Character limit — set max response length, enforced via truncation.
 Intelligent truncation exemption for copy‑paste content (steps, code, applications).
 Request character limit — prevents token consumption when user message is too long.
-Image support — downloads Discord images, converts to base64 for Cloudflare API.
+Image support — downloads Discord images, compresses them, converts to base64 for Cloudflare API.
 """
 
 import discord
@@ -21,6 +21,7 @@ import time
 import re
 import base64
 import traceback
+from PIL import Image
 from config import Config
 from utils.data import load, save
 
@@ -29,6 +30,10 @@ CF_MODEL   = "@cf/meta/llama-4-scout-17b-16e-instruct"
 
 DEFAULT_RATE_MESSAGES = 10
 DEFAULT_RATE_WINDOW   = 60
+
+# Max image size in bytes before compression (Cloudflare limit is ~1MB after base64)
+MAX_IMAGE_BYTES = 750_000  # ~750KB raw → ~1MB base64
+MAX_IMAGE_DIMENSIONS = (1024, 1024)  # Resize large images to this max
 
 # Patterns that indicate a response should NOT be truncated
 DEFAULT_EXEMPT_PATTERNS = [
@@ -81,6 +86,44 @@ async def _cf_request(account_id: str, api_token: str, messages: list, max_token
             return data["choices"][0]["message"]["content"].strip()
 
 
+def _compress_image(raw_bytes: bytes, mime_type: str) -> tuple[bytes, str]:
+    """
+    Compress/resize an image to fit within Cloudflare's limits.
+    Returns (compressed_bytes, output_mime_type).
+    """
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        
+        # Convert RGBA to RGB if needed (JPEG doesn't support alpha)
+        if img.mode in ("RGBA", "P"):
+            rgb_img = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            rgb_img.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
+            img = rgb_img
+        
+        # Resize if too large
+        if img.width > MAX_IMAGE_DIMENSIONS[0] or img.height > MAX_IMAGE_DIMENSIONS[1]:
+            img.thumbnail(MAX_IMAGE_DIMENSIONS, Image.Resampling.LANCZOS)
+        
+        # Save as JPEG with quality reduction until it fits
+        output = io.BytesIO()
+        quality = 85
+        img.save(output, format="JPEG", quality=quality, optimize=True)
+        
+        while output.tell() > MAX_IMAGE_BYTES and quality > 20:
+            output = io.BytesIO()
+            quality -= 10
+            img.save(output, format="JPEG", quality=quality, optimize=True)
+        
+        return output.getvalue(), "image/jpeg"
+    
+    except Exception as e:
+        print(f"[AI] Image compression failed: {e}")
+        # Return original if compression fails
+        return raw_bytes, mime_type
+
+
 def _build_system_prompt(memory: dict, char_limit: int = None) -> str:
     lines = [
         "You are a helpful assistant for this Discord server.",
@@ -112,7 +155,7 @@ def is_copy_paste_response(text: str, custom_patterns: list = None) -> bool:
 
 
 class AI(commands.Cog):
-    """🤖 Auto-respond AI channel with memory and rate limiting."""
+    """🤖 Auto-respond AI channel with memory, rate limiting, and image analysis."""
 
     slash = app_commands.Group(name="ai", description="AI auto-respond channel and memory management")
 
@@ -157,7 +200,7 @@ class AI(commands.Cog):
         d["channel_id"] = channel.id
         _save_ai_data(interaction.guild.id, d)
         await interaction.response.send_message(
-            f"✅ AI will now auto-respond to every message in {channel.mention}.", ephemeral=True
+            f"✅ AI will now auto-respond in {channel.mention}.", ephemeral=True
         )
 
     @slash.command(name="setcategory", description="Set a category where the AI auto-responds in every channel.")
@@ -168,8 +211,7 @@ class AI(commands.Cog):
         d["category_id"] = category.id
         _save_ai_data(interaction.guild.id, d)
         await interaction.response.send_message(
-            f"AI will now auto-respond in every text channel under **{category.name}**.",
-            ephemeral=True,
+            f"AI will now auto-respond under **{category.name}**.", ephemeral=True,
         )
 
     @slash.command(name="removechannel", description="Remove the AI auto-respond channel.")
@@ -177,104 +219,81 @@ class AI(commands.Cog):
     async def removechannel(self, interaction: discord.Interaction):
         d = _ai_data(interaction.guild.id)
         if "channel_id" not in d:
-            return await interaction.response.send_message("❌ No AI channel is currently set.", ephemeral=True)
+            return await interaction.response.send_message("❌ No AI channel set.", ephemeral=True)
         d.pop("channel_id")
         _save_ai_data(interaction.guild.id, d)
-        await interaction.response.send_message("✅ AI auto-respond channel removed.", ephemeral=True)
+        await interaction.response.send_message("✅ AI channel removed.", ephemeral=True)
 
     @slash.command(name="removecategory", description="Remove the AI auto-respond category.")
     @app_commands.default_permissions(administrator=True)
     async def removecategory(self, interaction: discord.Interaction):
         d = _ai_data(interaction.guild.id)
         if "category_id" not in d:
-            return await interaction.response.send_message("No AI category is currently set.", ephemeral=True)
+            return await interaction.response.send_message("No AI category set.", ephemeral=True)
         d.pop("category_id")
         _save_ai_data(interaction.guild.id, d)
-        await interaction.response.send_message("AI auto-respond category removed.", ephemeral=True)
+        await interaction.response.send_message("AI category removed.", ephemeral=True)
 
     # ── Rate / Response Limits ─────────────────────────
 
-    @slash.command(name="setlimit", description="Set the global per-user rate limit for the AI (applies to everyone).")
-    @app_commands.describe(
-        messages="Max number of messages allowed per user in the time window",
-        window="Time window in seconds (e.g. 60 = 1 minute)",
-    )
+    @slash.command(name="setlimit", description="Set the global per-user rate limit for the AI.")
+    @app_commands.describe(messages="Max messages per window", window="Window in seconds")
     @app_commands.default_permissions(administrator=True)
     async def setlimit(self, interaction: discord.Interaction, messages: int, window: int):
         if messages < 1 or window < 1:
-            return await interaction.response.send_message("❌ Both values must be 1 or greater.", ephemeral=True)
+            return await interaction.response.send_message("❌ Both values must be 1+.", ephemeral=True)
         d = _ai_data(interaction.guild.id)
         d["rate_limit"] = {"messages": messages, "window": window}
         _save_ai_data(interaction.guild.id, d)
-        await interaction.response.send_message(
-            f"✅ Global rate limit set: **{messages}** message(s) per **{window}s** per user.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"✅ Rate limit: **{messages}** msg per **{window}s**.", ephemeral=True)
 
-    @slash.command(name="setuserlimit", description="Set a rate limit for a specific user, overriding the global limit.")
-    @app_commands.describe(
-        user="The user to apply the custom limit to",
-        messages="Max number of messages allowed in the time window (0 = remove override)",
-        window="Time window in seconds",
-    )
+    @slash.command(name="setuserlimit", description="Set a rate limit for a specific user.")
+    @app_commands.describe(user="User", messages="Max messages (0 = remove)", window="Window in seconds")
     @app_commands.default_permissions(administrator=True)
     async def setuserlimit(self, interaction: discord.Interaction, user: discord.Member, messages: int, window: int):
         d = _ai_data(interaction.guild.id)
         user_limits = d.setdefault("user_limits", {})
         if messages == 0:
             user_limits.pop(str(user.id), None)
-            d["user_limits"] = user_limits
             _save_ai_data(interaction.guild.id, d)
-            return await interaction.response.send_message(
-                f"✅ Removed custom rate limit for {user.mention} — they will now use the global limit.",
-                ephemeral=True,
-            )
+            return await interaction.response.send_message(f"✅ Removed override for {user.mention}.", ephemeral=True)
         if messages < 1 or window < 1:
-            return await interaction.response.send_message(
-                "❌ Both values must be 1 or greater (or set messages to 0 to remove the override).",
-                ephemeral=True,
-            )
+            return await interaction.response.send_message("❌ Both values must be 1+.", ephemeral=True)
         user_limits[str(user.id)] = {"messages": messages, "window": window}
-        d["user_limits"] = user_limits
         _save_ai_data(interaction.guild.id, d)
-        await interaction.response.send_message(
-            f"✅ Custom rate limit for {user.mention}: **{messages}** message(s) per **{window}s**.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"✅ {user.mention}: **{messages}** msg per **{window}s**.", ephemeral=True)
 
-    @slash.command(name="charlimit", description="Set the maximum character length for AI responses. Use 0 to remove the limit.")
-    @app_commands.describe(limit="Maximum characters (1–2000) or 0 to disable")
+    @slash.command(name="charlimit", description="Set the max AI response length (0 = no limit).")
+    @app_commands.describe(limit="Max characters (1–2000) or 0")
     @app_commands.default_permissions(administrator=True)
     async def charlimit(self, interaction: discord.Interaction, limit: int):
         if limit < 0 or limit > 2000:
-            return await interaction.response.send_message("❌ Limit must be between 1 and 2000, or 0 to disable.", ephemeral=True)
+            return await interaction.response.send_message("❌ 1–2000 or 0.", ephemeral=True)
         d = _ai_data(interaction.guild.id)
         if limit == 0:
             d.pop("char_limit", None)
-            _save_ai_data(interaction.guild.id, d)
-            await interaction.response.send_message("✅ Character limit removed.", ephemeral=True)
+            await interaction.response.send_message("✅ Response limit removed.", ephemeral=True)
         else:
             d["char_limit"] = limit
-            _save_ai_data(interaction.guild.id, d)
-            await interaction.response.send_message(f"✅ AI responses truncated to **{limit}** characters.", ephemeral=True)
+            await interaction.response.send_message(f"✅ Responses capped at **{limit}** chars.", ephemeral=True)
+        _save_ai_data(interaction.guild.id, d)
 
-    @slash.command(name="requestcharlimit", description="Set the maximum length for user requests. Longer messages will be rejected (0 = unlimited).")
-    @app_commands.describe(limit="Maximum characters a user can send (0 = no limit)")
+    @slash.command(name="requestcharlimit", description="Set max user request length (0 = unlimited).")
+    @app_commands.describe(limit="Max characters (0 = no limit)")
     @app_commands.default_permissions(administrator=True)
     async def requestcharlimit(self, interaction: discord.Interaction, limit: int):
         if limit < 0:
-            return await interaction.response.send_message("❌ Limit must be 0 (unlimited) or a positive number.", ephemeral=True)
+            return await interaction.response.send_message("❌ 0 or positive.", ephemeral=True)
         d = _ai_data(interaction.guild.id)
         if limit == 0:
             d.pop("request_char_limit", None)
-            _save_ai_data(interaction.guild.id, d)
-            await interaction.response.send_message("✅ Request character limit removed.", ephemeral=True)
+            await interaction.response.send_message("✅ Request limit removed.", ephemeral=True)
         else:
             d["request_char_limit"] = limit
-            _save_ai_data(interaction.guild.id, d)
-            await interaction.response.send_message(f"✅ Requests limited to **{limit}** characters.", ephemeral=True)
+            await interaction.response.send_message(f"✅ Requests limited to **{limit}** chars.", ephemeral=True)
+        _save_ai_data(interaction.guild.id, d)
 
-    @slash.command(name="exemptpattern", description="Add or remove a custom pattern that exempts AI responses from truncation.")
+    @slash.command(name="exemptpattern", description="Add/remove a truncation exemption pattern.")
     @app_commands.describe(pattern="Regex pattern", remove="True to remove")
     @app_commands.default_permissions(administrator=True)
     async def exemptpattern(self, interaction: discord.Interaction, pattern: str, remove: bool = False):
@@ -283,121 +302,89 @@ class AI(commands.Cog):
         if remove:
             if pattern in patterns:
                 patterns.remove(pattern)
-                msg = f"✅ Removed pattern: `{pattern}`"
+                await interaction.response.send_message(f"✅ Removed `{pattern}`.", ephemeral=True)
             else:
-                msg = f"❌ Pattern `{pattern}` not found."
+                await interaction.response.send_message(f"❌ `{pattern}` not found.", ephemeral=True)
         else:
             if pattern not in patterns:
                 patterns.append(pattern)
-                msg = f"✅ Added pattern: `{pattern}`"
+                await interaction.response.send_message(f"✅ Added `{pattern}`.", ephemeral=True)
             else:
-                msg = f"⚠️ Pattern already exists."
-        d["exempt_patterns"] = patterns
+                await interaction.response.send_message(f"⚠️ Already exists.", ephemeral=True)
         _save_ai_data(interaction.guild.id, d)
-        await interaction.response.send_message(msg, ephemeral=True)
 
-    @slash.command(name="limits", description="Show current AI rate limits and model info.")
+    @slash.command(name="limits", description="Show current AI limits and model info.")
     @app_commands.default_permissions(manage_channels=True)
     async def limits(self, interaction: discord.Interaction):
         d = _ai_data(interaction.guild.id)
         gl = d.get("rate_limit")
-        global_str = f"{gl['messages']} msg per {gl['window']}s" if gl else f"{DEFAULT_RATE_MESSAGES} msg per {DEFAULT_RATE_WINDOW}s (default)"
+        gs = f"{gl['messages']}/{gl['window']}s" if gl else f"{DEFAULT_RATE_MESSAGES}/{DEFAULT_RATE_WINDOW}s (default)"
         ch_id = d.get("channel_id")
-        category_id = d.get("category_id")
         ch_str = f"<#{ch_id}>" if ch_id else "Not set"
-        category = interaction.guild.get_channel(int(category_id)) if category_id else None
-        category_str = category.name if category else ("Not set" if not category_id else f"Unknown category `{category_id}`")
-        char_limit_str = f"{d.get('char_limit')} chars" if d.get("char_limit") else "No limit"
-        req_limit_str = f"{d.get('request_char_limit')} chars" if d.get("request_char_limit") else "No limit"
-        user_limits = d.get("user_limits", {})
-        override_lines = [
-            f"• {interaction.guild.get_member(int(uid)).mention if interaction.guild.get_member(int(uid)) else f'<@{uid}>'} — {lim['messages']} msg / {lim['window']}s"
-            for uid, lim in user_limits.items()
-        ] if user_limits else ["None"]
-        overrides_str = "\n".join(override_lines)
-        custom_patterns = d.get("exempt_patterns", [])
-        patterns_str = ", ".join(f"`{p}`" for p in custom_patterns) if custom_patterns else "None (defaults)"
+        cat_id = d.get("category_id")
+        cat_str = interaction.guild.get_channel(int(cat_id)).name if cat_id and interaction.guild.get_channel(int(cat_id)) else ("Not set" if not cat_id else "Unknown")
         lines = [
             f"**Model:** `{CF_MODEL}`",
-            f"**AI Channel:** {ch_str}",
-            f"**AI Category:** {category_str}",
-            f"**Response char limit:** {char_limit_str}",
-            f"**Request char limit:** {req_limit_str}",
-            f"**Global rate limit:** {global_str}",
-            f"**Per-user overrides:**\n{overrides_str}",
-            f"**Exemption patterns:** {patterns_str}",
+            f"**Channel:** {ch_str}",
+            f"**Category:** {cat_str}",
+            f"**Response limit:** {d.get('char_limit', 'None')}",
+            f"**Request limit:** {d.get('request_char_limit', 'None')}",
+            f"**Rate limit:** {gs}",
+            f"**Image max:** {MAX_IMAGE_BYTES//1024}KB (auto-compressed)",
         ]
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-    # ── Memory commands ────────────────────────────────
+    # ── Memory ────────────────────────────────────────
 
-    @slash.command(name="memoryadd", description="Add or update a memory entry.")
-    @app_commands.describe(key="Label", value="Information to store")
+    @slash.command(name="memoryadd", description="Add/update a memory entry.")
+    @app_commands.describe(key="Label", value="Information")
     @app_commands.default_permissions(administrator=True)
     async def memoryadd(self, interaction: discord.Interaction, key: str, value: str):
         d = _ai_data(interaction.guild.id)
         d.setdefault("memory", {})[key] = value
         _save_ai_data(interaction.guild.id, d)
-        await interaction.response.send_message(f"✅ Memory entry `{key}` saved.", ephemeral=True)
+        await interaction.response.send_message(f"✅ `{key}` saved.", ephemeral=True)
 
     @slash.command(name="memoryremove", description="Remove a memory entry.")
     @app_commands.describe(key="Key to remove")
     @app_commands.default_permissions(administrator=True)
     async def memoryremove(self, interaction: discord.Interaction, key: str):
         d = _ai_data(interaction.guild.id)
-        memory = d.get("memory", {})
-        if key not in memory:
-            return await interaction.response.send_message(f"❌ No entry for `{key}`.", ephemeral=True)
-        del memory[key]
-        d["memory"] = memory
+        if key not in d.get("memory", {}):
+            return await interaction.response.send_message(f"❌ `{key}` not found.", ephemeral=True)
+        del d["memory"][key]
         _save_ai_data(interaction.guild.id, d)
-        await interaction.response.send_message(f"✅ Removed `{key}`.", ephemeral=True)
+        await interaction.response.send_message(f"✅ `{key}` removed.", ephemeral=True)
 
-    @slash.command(name="memorylist", description="List all saved memory entries.")
+    @slash.command(name="memorylist", description="List all memory entries.")
     @app_commands.default_permissions(manage_channels=True)
     async def memorylist(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
         d = _ai_data(interaction.guild.id)
         memory = d.get("memory", {})
         if not memory:
-            return await interaction.followup.send("No memory entries yet. Use `/ai memoryadd`.", ephemeral=True)
+            return await interaction.response.send_message("No entries yet.", ephemeral=True)
         lines = [f"**{k}:** {v}" for k, v in memory.items()]
-        pages = []
-        current, current_len = [], 0
-        for line in lines:
-            if current_len + len(line) + 1 > 1900 and current:
-                pages.append("\n".join(current))
-                current, current_len = [], 0
-            current.append(line)
-            current_len += len(line) + 1
-        if current:
-            pages.append("\n".join(current))
-        total = len(memory)
-        for i, page in enumerate(pages):
-            header = f"**Memory entries ({total} total){f' — page {i+1}/{len(pages)}' if len(pages) > 1 else ''}:**\n"
-            await interaction.followup.send(header + page, ephemeral=True)
+        await interaction.response.send_message("\n".join(lines)[:2000], ephemeral=True)
 
-    @slash.command(name="memoryexport", description="Export AI memory as a JSON file.")
+    @slash.command(name="memoryexport", description="Export memory as JSON.")
     @app_commands.default_permissions(administrator=True)
     async def memoryexport(self, interaction: discord.Interaction):
         d = _ai_data(interaction.guild.id)
         memory = d.get("memory", {})
-        content = json.dumps(memory, indent=2).encode()
-        file = discord.File(io.BytesIO(content), filename="ai_memory.json")
-        await interaction.response.send_message("📤 Memory export:", file=file, ephemeral=True)
+        file = discord.File(io.BytesIO(json.dumps(memory, indent=2).encode()), filename="ai_memory.json")
+        await interaction.response.send_message("📤 Export:", file=file, ephemeral=True)
 
-    @slash.command(name="memoryimport", description="Import AI memory from a JSON file.")
-    @app_commands.describe(file="Upload a .json file from /ai memoryexport")
+    @slash.command(name="memoryimport", description="Import memory from JSON.")
+    @app_commands.describe(file="Upload .json file")
     @app_commands.default_permissions(administrator=True)
     async def memoryimport(self, interaction: discord.Interaction, file: discord.Attachment):
         if not file.filename.endswith(".json"):
-            return await interaction.response.send_message("❌ Please upload a `.json` file.", ephemeral=True)
+            return await interaction.response.send_message("❌ .json only.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
         try:
-            raw = await file.read()
-            imported = json.loads(raw)
+            imported = json.loads(await file.read())
             if not isinstance(imported, dict):
-                return await interaction.followup.send("❌ File must contain a JSON object.", ephemeral=True)
+                return await interaction.followup.send("❌ Must be a JSON object.", ephemeral=True)
             d = _ai_data(interaction.guild.id)
             d["memory"] = imported
             _save_ai_data(interaction.guild.id, d)
@@ -405,9 +392,9 @@ class AI(commands.Cog):
         except json.JSONDecodeError:
             await interaction.followup.send("❌ Invalid JSON.", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ Import failed: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
 
-    # ── on_message with image support & request limit ──
+    # ── on_message ────────────────────────────────────
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -417,81 +404,78 @@ class AI(commands.Cog):
             return
 
         d = _ai_data(message.guild.id)
-        channel_id = d.get("channel_id")
-        category_id = d.get("category_id")
-        in_ai_channel = channel_id == message.channel.id
-        in_ai_category = (category_id is not None and getattr(message.channel, "category_id", None) == category_id)
-        if not in_ai_channel and not in_ai_category:
+        ch_id = d.get("channel_id")
+        cat_id = d.get("category_id")
+        if not (ch_id == message.channel.id or (cat_id and getattr(message.channel, "category_id", None) == cat_id)):
             return
         if not self._check_key():
             return
 
-        clean_user_message = message.clean_content.replace(f"@{message.guild.me.display_name}", "").strip()
+        clean = message.clean_content.replace(f"@{message.guild.me.display_name}", "").strip()
 
         req_limit = d.get("request_char_limit")
-        if req_limit and len(clean_user_message) > req_limit:
-            await message.reply("⚠️ Your request is too long. Please try again with a shorter request.", mention_author=False, delete_after=10)
+        if req_limit and len(clean) > req_limit:
+            await message.reply("⚠️ Too long. Please shorten your request.", mention_author=False, delete_after=10)
             return
 
         max_msgs, window = self._get_limit(d, message.author.id)
-        allowed, reset_in = self._check_rate_limit(message.guild.id, message.author.id, max_msgs, window)
-        if not allowed:
-            secs = int(reset_in)
-            mins, s = divmod(secs, 60)
-            time_str = f"{mins}m {s}s" if mins else f"{s}s"
-            await message.reply(f"You're sending messages too fast. Please wait **{time_str}**.", mention_author=False)
+        ok, wait = self._check_rate_limit(message.guild.id, message.author.id, max_msgs, window)
+        if not ok:
+            m, s = divmod(int(wait), 60)
+            t = f"{m}m {s}s" if m else f"{s}s"
+            await message.reply(f"⏳ Slow down! Wait **{t}**.", mention_author=False)
             return
 
         memory = d.get("memory", {})
         char_limit = d.get("char_limit")
-        custom_patterns = d.get("exempt_patterns", [])
-        system_prompt = _build_system_prompt(memory, char_limit)
+        patterns = d.get("exempt_patterns", [])
+        sys_prompt = _build_system_prompt(memory, char_limit)
 
-        guild_history = self._history.setdefault(message.guild.id, {})
-        user_history = guild_history.setdefault(message.author.id, [])
+        hist = self._history.setdefault(message.guild.id, {})
+        user_hist = hist.setdefault(message.author.id, [])
 
-        image_attachments = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
+        # ── Image handling with compression ────────────
+        imgs = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
 
-        if image_attachments:
+        if imgs:
             parts = []
-            if clean_user_message:
-                parts.append({"type": "text", "text": clean_user_message})
-            for img in image_attachments[:4]:
+            if clean:
+                parts.append({"type": "text", "text": clean})
+            for img in imgs[:4]:
                 try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(img.url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                            if resp.status == 200:
-                                raw = await resp.read()
-                                b64 = base64.b64encode(raw).decode()
-                                mime = resp.content_type or "image/png"
-                                parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-                            else:
-                                parts.append({"type": "text", "text": f"[Unable to download image: {img.filename}]"})
-                except Exception:
-                    parts.append({"type": "text", "text": f"[Failed to process image: {img.filename}]"})
+                    async with aiohttp.ClientSession() as s:
+                        async with s.get(img.url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                            if r.status != 200:
+                                parts.append({"type": "text", "text": f"[Download failed: {img.filename}]"})
+                                continue
+                            raw = await r.read()
+                            mime = r.content_type or "image/png"
+                            
+                            # Compress if needed
+                            if len(raw) > MAX_IMAGE_BYTES:
+                                raw, mime = _compress_image(raw, mime)
+                            
+                            b64 = base64.b64encode(raw).decode()
+                            parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                except Exception as e:
+                    parts.append({"type": "text", "text": f"[Image error: {e}]"})
             user_content = parts
         else:
-            user_content = clean_user_message
+            user_content = clean
 
-        api_messages = [{"role": "system", "content": system_prompt}]
-        api_messages.extend(user_history[-20:])
-        api_messages.append({"role": "user", "content": user_content})
+        msgs = [{"role": "system", "content": sys_prompt}]
+        msgs.extend(user_hist[-20:])
+        msgs.append({"role": "user", "content": user_content})
 
         async with message.channel.typing():
             try:
-                reply = await _cf_request(Config.CLOUDFLARE_ACCOUNT_ID, Config.CLOUDFLARE_API_TOKEN, api_messages)
-
-                if char_limit is not None and char_limit > 0:
-                    final_reply = reply[:2000] if is_copy_paste_response(reply, custom_patterns) else reply[:char_limit]
-                else:
-                    final_reply = reply[:2000]
-
-                user_history.append({"role": "user", "content": clean_user_message})
-                user_history.append({"role": "assistant", "content": reply})
-                if len(user_history) > 40:
-                    guild_history[message.author.id] = user_history[-40:]
-
-                await message.reply(final_reply, mention_author=False)
+                reply = await _cf_request(Config.CLOUDFLARE_ACCOUNT_ID, Config.CLOUDFLARE_API_TOKEN, msgs)
+                final = reply[:2000] if (not char_limit or is_copy_paste_response(reply, patterns)) else reply[:char_limit]
+                user_hist.append({"role": "user", "content": clean})
+                user_hist.append({"role": "assistant", "content": reply})
+                if len(user_hist) > 40:
+                    hist[message.author.id] = user_hist[-40:]
+                await message.reply(final, mention_author=False)
             except Exception:
                 print(f"[AI] on_message error: {traceback.format_exc()}")
 
