@@ -26,7 +26,7 @@ from config import Config
 from utils.data import load, save
 
 AI_FILE    = "ai.json"
-CF_MODEL   = "@cf/meta/llama-4-scout-17b-16e-instruct"
+CF_MODEL   = "@cf/moonshotai/kimi-k2.6"
 
 DEFAULT_RATE_MESSAGES = 10
 DEFAULT_RATE_WINDOW   = 60
