@@ -7,6 +7,8 @@ Export/import memory via JSON file.
 Per-user rate limiting — global default + per-user overrides.
 Character limit — set max response length, enforced via truncation.
 Intelligent truncation exemption for copy‑paste content (steps, code, applications).
+Request character limit — prevents token consumption when user message is too long.
+Image support — sends Discord image attachments to the AI for analysis.
 """
 
 import discord
@@ -105,13 +107,11 @@ def is_copy_paste_response(text: str, custom_patterns: list = None) -> bool:
     if custom_patterns:
         patterns.extend(custom_patterns)
     
-    # Compile regex patterns (case‑insensitive for keywords)
     for pat in patterns:
         try:
             if re.search(pat, text, re.IGNORECASE | re.MULTILINE):
                 return True
         except re.error:
-            # If a pattern is invalid, skip it
             continue
     return False
 
@@ -152,6 +152,8 @@ class AI(commands.Cog):
             return False, max(0.0, reset_in)
         stamps.append(now)
         return True, 0.0
+
+    # ── Channel / Category ────────────────────────────
 
     @slash.command(name="setchannel", description="Set the channel where the AI auto-responds to every message.")
     @app_commands.describe(channel="Channel to enable AI auto-responses in")
@@ -195,6 +197,8 @@ class AI(commands.Cog):
         d.pop("category_id")
         _save_ai_data(interaction.guild.id, d)
         await interaction.response.send_message("AI auto-respond category removed.", ephemeral=True)
+
+    # ── Rate / Response Limits ─────────────────────────
 
     @slash.command(name="setlimit", description="Set the global per-user rate limit for the AI (applies to everyone).")
     @app_commands.describe(
@@ -269,6 +273,28 @@ class AI(commands.Cog):
                 f"✅ AI responses will now be truncated to **{limit}** characters maximum.", ephemeral=True
             )
 
+    @slash.command(name="requestcharlimit", description="Set the maximum length for user requests. Longer messages will be rejected (0 = unlimited).")
+    @app_commands.describe(limit="Maximum characters a user can send (0 = no limit)")
+    @app_commands.default_permissions(administrator=True)
+    async def requestcharlimit(self, interaction: discord.Interaction, limit: int):
+        if limit < 0:
+            return await interaction.response.send_message("❌ Limit must be 0 (unlimited) or a positive number.", ephemeral=True)
+        d = _ai_data(interaction.guild.id)
+        if limit == 0:
+            d.pop("request_char_limit", None)
+            _save_ai_data(interaction.guild.id, d)
+            await interaction.response.send_message(
+                "✅ Request character limit removed. Users can send any length of message.",
+                ephemeral=True,
+            )
+        else:
+            d["request_char_limit"] = limit
+            _save_ai_data(interaction.guild.id, d)
+            await interaction.response.send_message(
+                f"✅ AI will only respond to requests **{limit} characters or shorter**. Longer messages will be rejected.",
+                ephemeral=True,
+            )
+
     @slash.command(name="exemptpattern", description="Add or remove a custom pattern that exempts AI responses from truncation.")
     @app_commands.describe(
         pattern="Regex pattern (e.g., 'staff application:', 'steps:')",
@@ -313,41 +339,38 @@ class AI(commands.Cog):
         category_str = category.name if category else ("Not set" if not category_id else f"Unknown category `{category_id}`")
 
         char_limit = d.get("char_limit")
-        if char_limit:
-            char_limit_str = f"{char_limit} characters"
-        else:
-            char_limit_str = "No enforced limit (Discord max 2000)"
+        char_limit_str = f"{char_limit} characters" if char_limit else "No enforced limit (Discord max 2000)"
+
+        req_limit = d.get("request_char_limit")
+        req_limit_str = f"{req_limit} characters" if req_limit else "No limit"
 
         user_limits = d.get("user_limits", {})
         if user_limits:
-            override_lines = []
-            for uid, lim in user_limits.items():
-                member = interaction.guild.get_member(int(uid))
-                name   = member.mention if member else f"<@{uid}>"
-                override_lines.append(f"• {name} — {lim['messages']} msg / {lim['window']}s")
+            override_lines = [
+                f"• {interaction.guild.get_member(int(uid)).mention if interaction.guild.get_member(int(uid)) else f'<@{uid}>'} — {lim['messages']} msg / {lim['window']}s"
+                for uid, lim in user_limits.items()
+            ]
             overrides_str = "\n".join(override_lines)
         else:
             overrides_str = "None"
 
-        # Show custom exemption patterns
         custom_patterns = d.get("exempt_patterns", [])
-        if custom_patterns:
-            patterns_str = ", ".join(f"`{p}`" for p in custom_patterns)
-        else:
-            patterns_str = "None (using defaults)"
+        patterns_str = ", ".join(f"`{p}`" for p in custom_patterns) if custom_patterns else "None (using defaults)"
 
         lines = [
             f"**Model:** `{CF_MODEL}`",
             f"**AI Channel:** {ch_str}",
             f"**AI Category:** {category_str}",
-            f"**Character limit:** {char_limit_str}",
+            f"**Response character limit:** {char_limit_str}",
+            f"**Request character limit:** {req_limit_str}",
             f"**Global rate limit:** {global_str}",
             f"**Per-user overrides:**\n{overrides_str}",
             f"**Custom exemption patterns:** {patterns_str}",
         ]
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-    # --- Memory commands (unchanged) ---
+    # ── Memory commands ────────────────────────────────
+
     @slash.command(name="memoryadd", description="Add or update a memory entry the AI will know about.")
     @app_commands.describe(
         key="Category or label, e.g. staff_names, server_rules, server_name",
@@ -434,9 +457,11 @@ class AI(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Import failed: {e}", ephemeral=True)
 
+    # ── on_message with image support & request limit ──
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild or not message.content:
+        if message.author.bot or not message.guild:
             return
         if self.bot.user not in message.mentions:
             return
@@ -454,6 +479,19 @@ class AI(commands.Cog):
         if not self._check_key():
             return
 
+        clean_user_message = message.clean_content.replace(f"@{message.guild.me.display_name}", "").strip()
+
+        # ── Request character limit check ──────────────
+        req_limit = d.get("request_char_limit")
+        if req_limit and len(clean_user_message) > req_limit:
+            await message.reply(
+                "⚠️ Your request is too long. Please try again with a shorter request.",
+                mention_author=False,
+                delete_after=10,
+            )
+            return
+
+        # ── Rate limit check ───────────────────────────
         max_msgs, window = self._get_limit(d, message.author.id)
         allowed, reset_in = self._check_rate_limit(message.guild.id, message.author.id, max_msgs, window)
         if not allowed:
@@ -473,32 +511,49 @@ class AI(commands.Cog):
 
         guild_history = self._history.setdefault(message.guild.id, {})
         user_history = guild_history.setdefault(message.author.id, [])
-        clean_user_message = message.clean_content.replace(f"@{message.guild.me.display_name}", "").strip()
 
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(user_history[-20:])
-        messages.append({"role": "user", "content": clean_user_message})
+        # ── Build messages array, include images if any ─
+        user_content = clean_user_message
+        # Check for image attachments
+        image_attachments = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
+
+        if image_attachments:
+            # Build content as a list of parts for multimodal
+            parts = []
+            if clean_user_message:
+                parts.append({"type": "text", "text": clean_user_message})
+            for img in image_attachments[:4]:  # limit to 4 images to be safe
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": img.url}
+                })
+            user_content = parts  # pass the list as content
+        else:
+            # Plain text
+            user_content = clean_user_message
+
+        api_messages = [{"role": "system", "content": system_prompt}]
+        api_messages.extend(user_history[-20:])
+        api_messages.append({"role": "user", "content": user_content})
 
         async with message.channel.typing():
             try:
                 reply = await _cf_request(
                     Config.CLOUDFLARE_ACCOUNT_ID,
                     Config.CLOUDFLARE_API_TOKEN,
-                    messages
+                    api_messages
                 )
 
-                # --- Intelligent truncation exemption ---
+                # ── Intelligent truncation exemption ────
                 if char_limit is not None and char_limit > 0:
-                    # Check if this response looks like copy‑paste material
                     if is_copy_paste_response(reply, custom_patterns):
-                        # Do not truncate; send full reply (Discord limit 2000)
                         final_reply = reply[:2000]
                     else:
-                        # Normal truncation
                         final_reply = reply[:char_limit]
                 else:
                     final_reply = reply[:2000]
 
+                # Update history with plain text (even if images were used)
                 user_history.append({"role": "user", "content": clean_user_message})
                 user_history.append({"role": "assistant", "content": reply})
                 if len(user_history) > 40:
