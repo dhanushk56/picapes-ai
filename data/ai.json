@@ -1,0 +1,22 @@
+{
+  "1498158542140477543": {
+    "category_id": 1514970178696384642,
+    "channel_id": 1514790155343626240,
+    "memory": {
+      "staff application": "**Here are the staff application questions:**  1. What is your age?  2. How long have you been in the server?  3. Do you have basic knowledge about moderation? 4. Tell some moderation commands.  5. What is the Major time you be active?  6. How Long can you be Active?  7. What are your strengths and weakness  8. Give a brief description about yourself.  9. If your application gets denied, will you argue with the staff?  (Always send all the questions in one message and never send one question per message. Send it along with the note and the note should be in bold. And ping the staff only when the user answers the questions. Not along with the questions. Let the user know their application is under review and staff will get back to you. Also if the user sends cancel, cancel their application and send the questions again and don't ping staff. Ping them only and only after you receive a response from the user. And don't say your application is under review along with the questions. Send only the questions first and then when the user answers the questions, tell them your application is under review, kindly refrain from pinging staff, and then ping staff. Then and only then shall you ping staff. Always make sure to ping staff in the message where you notify the user to be patient)",
+      "renewal": "1. Go to https://discord.com/channels/836505202105909308/1304395585901826048 and type /renew in chat.\n2. Open the website and complete all the steps\n3. Make sure to disable the ad blocker to allow the process to complete.\n4. Wait 30 seconds for each ad to run and then wait 15 seconds for it to process.\n5. Scroll down and hit continue.\n6. Repeat steps **4** and **5** for steps 2 of 3 and 3 of 3.\n7. Click on get link and click renew.\n\n**Congratulations: You have successfully renewed your account**\n\n*Note: Brave Browser will not work in this process. Google Chrome or Microsoft Edge is recommended*",
+      "bug report": "Tell me what bug you would like to report and I will let the staff know. (ping staff only and only after the user tells the bug. Not before then when you ask them what the bug is. Only after they respond, ping staff)",
+      "cape submit": "Kindly provide these details and I will let the staff know (ping staff after response)\n1. Name of the Cape\n2. Image of the Cape\n3. Version in which the Cape works\n4. Short description of the Cape\n5. Why would you like this added",
+      "staff role": "<@&1498827274315890738> (always ping this role whenever asked. Doesn't matter if it is tickets or general support, if a user says ping staff or any command which means to ping staff, always ping this role only. And insert it between <> to make the ping actually works)",
+      "ping": "ping staff only when I ask you to and only for the ones where I explicitely mention ping staff in the memory and only in that format. don't ping staff in the first message when I say ping them only and only after the user gives a response to your question. Also ping staff if you don't know the correct solution. Don't waste messages and my daily limit trying to solve it if you don't know. Just let the user know and escalate it to staff",
+      "shadow nova": "<@1077905352244338688> is one of the staff members",
+      "answer limit": "Keep your answers as short as possible. Never should your answers exceed 250 characters (unless it's staff apply for or some kind of thing which you are pasting directly from memory). If you exceed 250, the neurons are going to run out so quickly. Responses which you generate should not exceed 250 characters no matter what. Remember that. Doesn't matter which user in the server asks the questions always make sure to keep the answers short to preserve neurons.",
+      "YouTube partnership": "Apply for YouTube\n\nPartnership!lf you want to partner, reply with your channel link, subscriber count, and a screenshot of your recent video views. Briefly state how you will promote our server, and our staff will review it shortly! (Ping staff only after response, not before)",
+      "partnership": "Please provide the following details: Server name, member count (excluding bots), permanent invite link, server objective, active or not? (Ping staff only after response, not before)"
+    },
+    "rate_limit": {
+      "messages": 5,
+      "window": 3600
+    }
+  }
+}
