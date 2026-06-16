@@ -517,19 +517,28 @@ class AI(commands.Cog):
         # Check for image attachments
         image_attachments = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
 
-        if image_attachments:
-            # Build content as a list of parts for multimodal
+                if image_attachments:
             parts = []
             if clean_user_message:
                 parts.append({"type": "text", "text": clean_user_message})
-            for img in image_attachments[:4]:  # limit to 4 images to be safe
-                parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": img.url}
-                })
-            user_content = parts  # pass the list as content
+            for img in image_attachments[:4]:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(img.url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                            if resp.status == 200:
+                                raw = await resp.read()
+                                b64 = base64.b64encode(raw).decode()
+                                mime = resp.content_type or "image/png"
+                                parts.append({
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:{mime};base64,{b64}"}
+                                })
+                            else:
+                                parts.append({"type": "text", "text": f"[Unable to download image: {img.filename}]"})
+                except Exception:
+                    parts.append({"type": "text", "text": f"[Failed to process image: {img.filename}]"})
+            user_content = parts
         else:
-            # Plain text
             user_content = clean_user_message
 
         api_messages = [{"role": "system", "content": system_prompt}]
